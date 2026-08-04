@@ -1,0 +1,968 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IFT Prep — Workout Tracker</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{background:#0a0c0f;color:#e6edf3;font-family:system-ui,-apple-system,sans-serif;min-height:100vh;}
+  input,textarea,select{font-family:inherit;}
+  ::-webkit-scrollbar{width:6px;}
+  ::-webkit-scrollbar-track{background:#161b22;}
+  ::-webkit-scrollbar-thumb{background:#30363d;border-radius:3px;}
+  #root{max-width:680px;margin:0 auto;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const{useState,useEffect,useCallback}=React;
+
+// ── CONFIG ────────────────────────────────────────────────────────────────────
+// Use relative URL — works on localhost and Railway without changes
+const SERVER = "";
+const APP_KEY = ""; // Set this to match APP_KEY env var on Railway if you enable auth
+
+// ── DATA LAYER ────────────────────────────────────────────────────────────────
+const DB = {
+  async load() {
+    try {
+      const headers = APP_KEY ? {"X-App-Key": APP_KEY} : {};
+      const r = await fetch(`${SERVER}/data`, {headers});
+      if (!r.ok) throw new Error("server error");
+      return await r.json();
+    } catch(e) {
+      console.warn("Load failed:", e);
+      return null;
+    }
+  },
+  async save(data) {
+    try {
+      const headers = {"Content-Type": "application/json"};
+      if (APP_KEY) headers["X-App-Key"] = APP_KEY;
+      const r = await fetch(`${SERVER}/data`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(data),
+      });
+      return r.ok;
+    } catch(e) {
+      console.warn("Save failed:", e);
+      return false;
+    }
+  }
+};
+
+// ── PALETTE ───────────────────────────────────────────────────────────────────
+const C={
+  bg:"#0a0c0f",surface:"#111318",card:"#161b22",border:"#21262d",border2:"#30363d",
+  text:"#e6edf3",muted:"#7d8590",dim:"#444c56",
+  amber:"#d29922",amberLo:"#d2992218",green:"#3fb950",greenLo:"#3fb95018",
+  orange:"#f0883e",red:"#f85149",blue:"#58a6ff",blueLo:"#58a6ff14",
+  purple:"#bc8cff",cyan:"#22d3ee",
+};
+
+// ── HELPERS ───────────────────────────────────────────────────────────────────
+function fmtTime(secs){const m=Math.floor(secs/60),s=secs%60;return`${m}:${String(s).padStart(2,"0")}`;}
+function parseTime(str){if(!str)return null;const p=str.split(":");if(p.length<2)return null;const[m,s]=p.map(Number);return isNaN(m)||isNaN(s)?null:m*60+s;}
+function pct(val,metric){
+  if(!metric.higherIsBetter){const r=metric.baseline-metric.comp;return Math.min(100,Math.max(0,Math.round(((metric.baseline-val)/r)*100)));}
+  const r=metric.comp-metric.baseline;return Math.min(100,Math.max(0,Math.round(((val-metric.baseline)/r)*100)));
+}
+function calcTarget(actual,lastTarget,prescribed,ceiling,higherIsBetter){
+  if(actual==null) return prescribed;
+  // Only compound from actual — never from a target the user didn't reach
+  // If they hit or exceeded the target, use target as base (rewards consistency)
+  // If they fell short, use actual as base (no penalty compounding)
+  const metTarget = higherIsBetter ? actual >= lastTarget : actual <= lastTarget;
+  const base = metTarget ? lastTarget : actual;
+  const next = higherIsBetter ? Math.round(base * 1.10) : Math.round(base * 0.91);
+  if(higherIsBetter) return Math.min(next, ceiling ?? 9999);
+  return Math.max(next, ceiling ?? 0);
+}
+
+// ── IFT METRICS ──────────────────────────────────────────────────────────────
+const IFT=[
+  {key:"pullups",label:"Pull-ups",        unit:"reps", min:8,  comp:20,baseline:6,  higherIsBetter:true},
+  {key:"pushups",label:"Push-ups (2 min)",unit:"reps", min:40, comp:80,baseline:35, higherIsBetter:true},
+  {key:"situps", label:"Sit-ups (2 min)", unit:"reps", min:50, comp:80,baseline:25, higherIsBetter:true},
+  {key:"run",    label:"1.5mi Run",       unit:"mm:ss",min:630,comp:540,baseline:610,higherIsBetter:false},
+];
+
+// ── LOG SCHEMAS ───────────────────────────────────────────────────────────────
+const LOG_SCHEMAS={
+  A:[
+    {key:"sets",    label:"Sets completed",       type:"num", placeholder:"4",    unit:"sets"},
+    {key:"pushups", label:"Push-ups / set",        type:"num", placeholder:"25",   unit:"reps",trackProgression:true,ceiling:null,prescribedTarget:25},
+    {key:"run1",    label:"200m interval — lap 1", type:"time",placeholder:"1:05", unit:"/200m",trackProgression:true,higherIsBetter:false,ceiling:null},
+    {key:"run2",    label:"200m interval — lap 2", type:"time",placeholder:"1:05", unit:"/200m"},
+    {key:"run3",    label:"200m interval — lap 3", type:"time",placeholder:"1:05", unit:"/200m"},
+    {key:"run4",    label:"200m interval — lap 4", type:"time",placeholder:"1:05", unit:"/200m"},
+    {key:"plank",   label:"Plank hold",            type:"time",placeholder:"1:30", unit:""},
+    {key:"notes",   label:"Notes",                 type:"text"},
+  ],
+  B:[
+    {key:"sets",    label:"Sets completed",        type:"num", placeholder:"4",  unit:"sets"},
+    {key:"situps1", label:"Sit-ups set 1/round",   type:"num", placeholder:"25", unit:"reps",trackProgression:true,ceiling:null,prescribedTarget:25},
+    {key:"situps2", label:"Sit-ups set 2/round",   type:"num", placeholder:"15", unit:"reps",trackProgression:true,ceiling:null,prescribedTarget:15},
+    {key:"pushups", label:"Push-ups / set",        type:"num", placeholder:"25", unit:"reps",trackProgression:true,ceiling:null,prescribedTarget:25},
+    {key:"run1",    label:"200m interval — lap 1", type:"time",placeholder:"0:50",unit:"/200m",trackProgression:true,higherIsBetter:false,ceiling:null},
+    {key:"run2",    label:"200m interval — lap 2", type:"time",placeholder:"0:50",unit:"/200m"},
+    {key:"run3",    label:"200m interval — lap 3", type:"time",placeholder:"0:50",unit:"/200m"},
+    {key:"run4",    label:"200m interval — lap 4", type:"time",placeholder:"0:50",unit:"/200m"},
+    {key:"plank",   label:"Plank hold (total sec)",type:"num", placeholder:"160",unit:"sec"},
+    {key:"notes",   label:"Notes",                 type:"text"},
+  ],
+  C:[
+    {key:"rounds",  label:"Rounds completed",          type:"num", placeholder:"2",   unit:"rounds"},
+    {key:"pullups", label:"Pull-ups / round",          type:"num", placeholder:"6",   unit:"reps",trackProgression:true,ceiling:20,prescribedTarget:6},
+    {key:"pushups", label:"Push-ups / round",          type:"num", placeholder:"30",  unit:"reps",trackProgression:true,ceiling:null,prescribedTarget:30},
+    {key:"situps",  label:"Sit-ups / round",           type:"num", placeholder:"25",  unit:"reps",trackProgression:true,ceiling:null,prescribedTarget:25},
+    {key:"lap1",    label:"400m recovery — round 1",   type:"time",placeholder:"2:30",unit:"/400m",trackProgression:true,higherIsBetter:false,ceiling:null},
+    {key:"lap2",    label:"400m recovery — round 2",   type:"time",placeholder:"2:30",unit:"/400m"},
+    {key:"plank",   label:"Plank hold",                type:"time",placeholder:"2:00",unit:""},
+    {key:"notes",   label:"Notes",                     type:"text"},
+  ],
+  D:[
+    {key:"rounds",  label:"Rounds completed",          type:"num", placeholder:"4",   unit:"rounds"},
+    {key:"pullups", label:"Pull-ups / round",          type:"num", placeholder:"5",   unit:"reps",trackProgression:true,ceiling:20,prescribedTarget:5},
+    {key:"pushups", label:"Push-ups / round",          type:"num", placeholder:"30",  unit:"reps",trackProgression:true,ceiling:null,prescribedTarget:30},
+    {key:"situps",  label:"Sit-ups / round",           type:"num", placeholder:"20",  unit:"reps",trackProgression:true,ceiling:null,prescribedTarget:20},
+    {key:"run1",    label:"200m jog — round 1",        type:"time",placeholder:"1:30",unit:"/200m",trackProgression:true,higherIsBetter:false,ceiling:null},
+    {key:"run2",    label:"200m jog — round 2",        type:"time",placeholder:"1:30",unit:"/200m"},
+    {key:"run3",    label:"200m jog — round 3",        type:"time",placeholder:"1:30",unit:"/200m"},
+    {key:"run4",    label:"200m jog — round 4",        type:"time",placeholder:"1:30",unit:"/200m"},
+    {key:"plank",   label:"Plank hold",                type:"time",placeholder:"1:45",unit:""},
+    {key:"notes",   label:"Notes",                     type:"text"},
+  ],
+  N:[
+    {key:"pullups", label:"Pull-ups",              type:"num", placeholder:"0",    unit:"reps",trackProgression:true,ceiling:20,iftKey:"pullups",prescribedTarget:null},
+    {key:"pushups", label:"Push-ups (2 min)",      type:"num", placeholder:"0",    unit:"reps",trackProgression:true,ceiling:80,iftKey:"pushups",prescribedTarget:null},
+    {key:"situps",  label:"Sit-ups (2 min)",       type:"num", placeholder:"0",    unit:"reps",trackProgression:true,ceiling:80,iftKey:"situps",prescribedTarget:null},
+    {key:"run",     label:"1.5mi run time",        type:"time",placeholder:"10:00",unit:"",    trackProgression:true,ceiling:540,higherIsBetter:false,iftKey:"run",prescribedTarget:null},
+    {key:"notes",   label:"Notes",                 type:"text"},
+  ],
+  P:[
+    {key:"pyramidHeight",label:"Pyramid height (ascending sets)",type:"num",placeholder:"5",  unit:"sets",trackProgression:true,ceiling:10,prescribedTarget:5},
+    {key:"pullupTotal",  label:"Pull-up total",    type:"num", placeholder:"39",  unit:"reps",trackProgression:true,ceiling:100,prescribedTarget:39},
+    {key:"pushupTotal",  label:"Push-up total",    type:"num", placeholder:"182", unit:"reps",trackProgression:true,ceiling:200,prescribedTarget:182},
+    {key:"lungeTotal",   label:"Lunge total",      type:"num", placeholder:"270", unit:"reps",trackProgression:true,ceiling:300,prescribedTarget:270},
+    {key:"lapPace1",     label:"Finisher — lap 1 pace",        type:"time",placeholder:"1:25",unit:"/400m",trackProgression:true,higherIsBetter:false,ceiling:null},
+    {key:"finSitups1",   label:"Finisher — lap 1 sit-ups",     type:"num", placeholder:"25", unit:"reps",trackProgression:true,ceiling:null,prescribedTarget:25},
+    {key:"finPlank1",    label:"Finisher — lap 1 plank hold",  type:"time",placeholder:"1:00",unit:""},
+    {key:"lapPace2",     label:"Finisher — lap 2 pace",        type:"time",placeholder:"1:25",unit:"/400m"},
+    {key:"finSitups2",   label:"Finisher — lap 2 sit-ups",     type:"num", placeholder:"25", unit:"reps"},
+    {key:"finPlank2",    label:"Finisher — lap 2 plank hold",  type:"time",placeholder:"1:00",unit:""},
+    {key:"notes",        label:"Notes",            type:"text"},
+  ],
+  R:[
+    {key:"pullupTotal",   label:"Pull-up total (10-min block)", type:"num",placeholder:"40", unit:"reps",trackProgression:true,ceiling:null,prescribedTarget:40},
+    {key:"pushupTotal",   label:"Push-up total (10-min block)", type:"num",placeholder:"120",unit:"reps",trackProgression:true,ceiling:null,prescribedTarget:120},
+    {key:"lowerTotal",    label:"Lower body total (10-min block)",type:"num",placeholder:"200",unit:"reps",trackProgression:true,ceiling:null,prescribedTarget:200},
+    {key:"lowerVariation",label:"Lower body variation",          type:"select",options:["Walking Lunges","Banded Good Mornings","Glute Bridges","Supermans + Lateral Lunges","Reverse Lunges"]},
+    {key:"lapPace1",      label:"Finisher — lap 1",              type:"time",placeholder:"1:25",unit:"/400m",trackProgression:true,higherIsBetter:false,ceiling:null},
+    {key:"lapPace2",      label:"Finisher — lap 2",              type:"time",placeholder:"1:25",unit:"/400m"},
+    {key:"notes",         label:"Notes",                         type:"text"},
+  ],
+  S:[
+    {key:"distance",    label:"Distance",              type:"num", placeholder:"3.1", unit:"mi"},
+    {key:"avgPace",     label:"Avg pace",              type:"time",placeholder:"9:19",unit:"/mi",trackProgression:true,higherIsBetter:false,ceiling:null},
+    {key:"avgHR",       label:"Avg HR",                type:"num", placeholder:"145", unit:"bpm"},
+    {key:"pullups1",    label:"Pull-ups — set 1",      type:"num", placeholder:"5",   unit:"reps",trackProgression:true,ceiling:20,prescribedTarget:5},
+    {key:"pullups2",    label:"Pull-ups — set 2",      type:"num", placeholder:"5",   unit:"reps"},
+    {key:"pullups3",    label:"Pull-ups — set 3",      type:"num", placeholder:"5",   unit:"reps"},
+    {key:"pushups1",    label:"Push-ups — set 1",      type:"num", placeholder:"20",  unit:"reps",trackProgression:true,ceiling:null,prescribedTarget:20},
+    {key:"pushups2",    label:"Push-ups — set 2",      type:"num", placeholder:"20",  unit:"reps"},
+    {key:"pushups3",    label:"Push-ups — set 3",      type:"num", placeholder:"20",  unit:"reps"},
+    {key:"situps1",     label:"Sit-ups — set 1",       type:"num", placeholder:"20",  unit:"reps",trackProgression:true,ceiling:null,prescribedTarget:20},
+    {key:"situps2",     label:"Sit-ups — set 2",       type:"num", placeholder:"20",  unit:"reps"},
+    {key:"situps3",     label:"Sit-ups — set 3",       type:"num", placeholder:"20",  unit:"reps"},
+    {key:"plank",       label:"Plank hold",            type:"time",placeholder:"1:00",unit:""},
+    {key:"cooldownPace",label:"Cooldown pace",         type:"time",placeholder:"10:30",unit:"/mi"},
+    {key:"notes",       label:"Notes",                 type:"text"},
+  ],
+  DEFAULT:[{key:"notes",label:"Notes",type:"text"}],
+  FIN_TUE:[
+    {key:"situps1",  label:"Sit-ups — set 1",  type:"num",placeholder:"25",unit:"reps",trackProgression:true,ceiling:null},
+    {key:"situps2",  label:"Sit-ups — set 2",  type:"num",placeholder:"25",unit:"reps",trackProgression:true,ceiling:null},
+    {key:"situps3",  label:"Sit-ups — set 3",  type:"num",placeholder:"25",unit:"reps",trackProgression:true,ceiling:null},
+    {key:"situpsMax",label:"Sit-ups — max set",type:"num",placeholder:"20",unit:"reps",trackProgression:true,ceiling:null},
+    {key:"plank",    label:"Plank hold (max)", type:"time",placeholder:"1:30",unit:""},
+    {key:"notes",    label:"Notes",            type:"text"},
+  ],
+  FIN_THU:[
+    {key:"situps1",label:"Sit-ups — set 1",type:"num",placeholder:"20",unit:"reps",trackProgression:true,ceiling:null},
+    {key:"situps2",label:"Sit-ups — set 2",type:"num",placeholder:"20",unit:"reps",trackProgression:true,ceiling:null},
+    {key:"plank1", label:"Plank — hold 1", type:"time",placeholder:"1:30",unit:""},
+    {key:"plank2", label:"Plank — hold 2", type:"time",placeholder:"1:30",unit:""},
+    {key:"pullups",label:"Pull-ups (if bar available)",type:"num",placeholder:"0",unit:"reps"},
+    {key:"notes",  label:"Notes",          type:"text"},
+  ],
+};
+function getSchema(wkId){return LOG_SCHEMAS[wkId]??LOG_SCHEMAS.DEFAULT;}
+
+// ── WORKOUTS ──────────────────────────────────────────────────────────────────
+const WORKOUTS={
+  A:{name:"Base Circuit",          format:"Circuit",  tag:"Recovery",       emoji:"🔄"},
+  B:{name:"Situp Overload",        format:"Circuit",  tag:"Situp Priority", emoji:"🧘"},
+  C:{name:"Full IFT Circuit",      format:"Circuit",  tag:"All Events",     emoji:"🎯"},
+  D:{name:"Push-Pull Circuit",     format:"Circuit",  tag:"Upper Strength", emoji:"💪"},
+  E:{name:"Band Lower Body",       format:"Circuit",  tag:"Band Day",       emoji:"🔴"},
+  F:{name:"EMOM Push-Plank-Lower", format:"EMOM",     tag:"Your Design",    emoji:"⏱️"},
+  G:{name:"EMOM Situp Density",    format:"EMOM",     tag:"Situp Volume",   emoji:"📈"},
+  H:{name:"EMOM Pull + Situp",     format:"EMOM",     tag:"Pull Frequency", emoji:"🌳"},
+  I:{name:"1.5mi Speed Work",      format:"Intervals",tag:"Run Day",        emoji:"⚡"},
+  J:{name:"Pyramid Run",           format:"Intervals",tag:"Run Volume",     emoji:"🏃"},
+  K:{name:"Push-up Ladder",        format:"Ladder",   tag:"Push Specific",  emoji:"🪜"},
+  L:{name:"Situp Ladder",          format:"Ladder",   tag:"Situp Specific", emoji:"🪜"},
+  M:{name:"Tabata Upper + Pull",   format:"Tabata",   tag:"High Intensity", emoji:"🔥"},
+  N:{name:"IFT Test Simulation",   format:"Test",     tag:"Benchmark",      emoji:"📋"},
+  O:{name:"20-Min Grind",          format:"Grind",    tag:"Volume Day",     emoji:"⏰"},
+  P:{name:"PT Pyramid",            format:"Pyramid",  tag:"Stew Smith",     emoji:"🔺"},
+  Q:{name:"100-Rep Pull-up Grind", format:"Grind",    tag:"Stew Smith",     emoji:"💯"},
+  R:{name:"Isolated EMOM Blocks",  format:"EMOM",     tag:"Wednesday",      emoji:"🎯"},
+  S:{name:"Zone 2 + Calisthenics", format:"Zone 2",   tag:"Friday",         emoji:"🫀"},
+};
+const FORMAT_COLOR={
+  Circuit:C.green,EMOM:C.amber,Intervals:C.purple,Ladder:C.orange,
+  Tabata:C.red,Grind:C.blue,Test:C.text,Pyramid:"#e879f9","Zone 2":C.cyan,
+};
+
+// ── BLOCKS ────────────────────────────────────────────────────────────────────
+const BLOCKS=[
+  {id:1,name:"Block 1 — Aerobic Base",phase:"Zone 2 Foundation",
+   goal:"Build aerobic engine. Hit IFT minimums on calisthenics.",
+   runFocus:"Zone 2 mileage — 3 miles Friday, building to 4",
+   weeks:[
+     {label:"Week 1",mon:"B",wed:"R",fri:"S"},
+     {label:"Week 2",mon:"C",wed:"P",fri:"S"},
+     {label:"Week 3",mon:"D",wed:"R",fri:"S"},
+     {label:"Week 4 — Test",mon:"N",wed:"A",fri:"N"},
+   ]},
+  {id:2,name:"Block 2 — Volume",phase:"Mileage + Calisthenics Volume",
+   goal:"15 pull-ups, 60 push-ups, 65 sit-ups. Friday mileage to 4–5 miles.",
+   runFocus:"Zone 2 Friday climbing to 5 miles. Tempo segments added mid-run.",
+   weeks:[
+     {label:"Week 1",mon:"P",wed:"R",fri:"S"},
+     {label:"Week 2",mon:"Q",wed:"P",fri:"S"},
+     {label:"Week 3",mon:"P",wed:"R",fri:"S"},
+     {label:"Week 4 — Test",mon:"N",wed:"A",fri:"N"},
+   ]},
+  {id:3,name:"Block 3 — Intensity",phase:"Hamilton 4-Run Structure",
+   goal:"20 pull-ups, 75 push-ups, 75 sit-ups, sub-9:30 run.",
+   runFocus:"Speed day Mon, tempo Wed, two easy runs Fri. Boxing dropped.",
+   weeks:[
+     {label:"Week 1",mon:"Q",wed:"R",fri:"I"},
+     {label:"Week 2",mon:"P",wed:"P",fri:"J"},
+     {label:"Week 3",mon:"Q",wed:"R",fri:"I"},
+     {label:"Week 4 — Test",mon:"N",wed:"A",fri:"N"},
+   ]},
+  {id:4,name:"Block 4 — Peak & Taper",phase:"IFT Simulation + Taper",
+   goal:"20+ pull-ups, 80+ push-ups, 80+ sit-ups, sub-9:00 run. IFT-ready.",
+   runFocus:"Full intensity weeks 1–3. Week 4 taper — volume drops 40%.",
+   weeks:[
+     {label:"Week 1",mon:"Q",wed:"R",fri:"I"},
+     {label:"Week 2",mon:"M",wed:"P",fri:"J"},
+     {label:"Week 3",mon:"N",wed:"A",fri:"N"},
+     {label:"Week 4 — Taper",mon:"D",wed:"A",fri:"S"},
+   ]},
+];
+
+const BOXING_FINISHERS={
+  tue:{label:"Sit-up Finisher",emoji:"🧘",duration:"~12 min",tag:"Core Volume",color:C.purple,
+    exercises:[
+      {icon:"🧘",name:"Sit-ups",detail:"3 × 25 reps",note:"Military standard — 60 sec rest between sets"},
+      {icon:"🧘",name:"Sit-ups",detail:"Max reps × 1",note:"Last set — to failure with good form"},
+      {icon:"⏱️",name:"Plank",detail:"Max hold",note:"Finish with one max effort hold"},
+    ],
+    notes:"No push-ups — boxing already taxed your chest and shoulders. Pure sit-up volume targeting your biggest IFT gap."},
+  thu:{label:"Pull-up + Core Finisher",emoji:"💪",duration:"~10 min",tag:"Pull Frequency",color:C.blue,
+    exercises:[
+      {icon:"🧘",name:"Sit-ups",detail:"2 × 20 reps",note:"Military standard — 45 sec rest between"},
+      {icon:"⏱️",name:"Plank",detail:"2 × 1:30 hold",note:"60 sec rest between — lighter than Tuesday"},
+      {icon:"📝",name:"Pull-ups",detail:"If a bar available: 3 × max reps",note:"Full hang, full extension. Skip if no bar."},
+    ],
+    notes:"Thursday is lighter — Friday track day is tomorrow. Keep intensity low."},
+};
+
+// ── WORKOUT DETAIL ─────────────────────────────────────────────────────────────
+// detail strings use {fieldKey} placeholders that get resolved from progression targets at render time
+const WORKOUT_DETAIL={
+  A:{duration:"~35 min",rounds:"4 rounds",rest:"90 sec between rounds",
+    exercises:[
+      {icon:"🏃",name:"Run",detail:"200m (½ lap)",note:"Moderate pace"},
+      {icon:"🦵",name:"Walking Lunges",detail:"Full field (~50 reps)",note:"Long stride, heel drive, slight forward lean — glute-dominant"},
+      {icon:"🔄",name:"Reverse Lunges",detail:"20 reps (10 each leg)",note:"More hamstring and glute than forward — controlled descent"},
+      {icon:"🍑",name:"Two-leg Glute Bridge",detail:"15 reps",note:"Drive through heels, squeeze glutes at top. Block 1 baseline."},
+      {icon:"🦸",name:"Supermans",detail:"15 reps",note:"Lower back and glute counterbalance"},
+      {icon:"💪",name:"Push-ups",detail:"{pushups} reps",note:"Strict IFT form"},
+      {icon:"⏱️",name:"Plank",detail:"1:30 hold",note:""},
+    ],
+    notes:"Recovery day baseline. Supermans mandatory — counterbalances anterior load.",
+    whyItWorks:"Alternates cardio, posterior chain lower body, and upper push."},
+  B:{duration:"~40 min",rounds:"4 rounds",rest:"90 sec between rounds",
+    exercises:[
+      {icon:"🏃",name:"Run",detail:"200m",note:""},
+      {icon:"🧘",name:"Sit-ups — set 1",detail:"{situps1} reps",note:"Military standard: feet flat, hands across chest"},
+      {icon:"💪",name:"Push-ups",detail:"{pushups} reps",note:"Strict form"},
+      {icon:"🧘",name:"Sit-ups — set 2",detail:"{situps2} reps",note:"Second set same round — run is the only rest"},
+      {icon:"🦵",name:"Walking Lunges",detail:"Full field (~50 reps)",note:"Long stride, heel drive, forward lean — glute-dominant"},
+      {icon:"🔄",name:"Reverse Lunges",detail:"20 reps (10 each leg)",note:"Hamstring and glute dominant"},
+      {icon:"🍑",name:"Two-leg Glute Bridge",detail:"15 reps",note:"Drive through heels, feel it in glutes."},
+      {icon:"🦸",name:"Supermans",detail:"15 reps",note:"Mandatory — counterbalances sit-up volume"},
+    ],
+    notes:"Back-side balance: plank hold in seconds = total sit-up count. Bridge progression: Block 1=two-leg, Block 2=banded, Block 3=single-leg, Block 4=banded single-leg.",
+    whyItWorks:"Double sit-up sets per round accumulates maximum volume efficiently."},
+  C:{duration:"~45 min",rounds:"2 rounds",rest:"2 min between rounds",
+    exercises:[
+      {icon:"🌳",name:"Pull-ups",detail:"{pullups} reps",note:"Walk to tree — full hang, chin over bar, full extension"},
+      {icon:"🏃",name:"Run",detail:"400m (full lap)",note:"Jog back as active recovery"},
+      {icon:"💪",name:"Push-ups",detail:"{pushups} reps",note:"Strict IFT form"},
+      {icon:"🧘",name:"Sit-ups",detail:"{situps} reps",note:"Full military standard"},
+      {icon:"🦵",name:"Walking Lunges",detail:"Full field (~50 reps)",note:"Glute-dominant form"},
+      {icon:"🔄",name:"Lateral Lunges",detail:"20 each side",note:"Wide step, sit into the hip"},
+      {icon:"🍑",name:"Glute Bridge",detail:"15 reps",note:"Block 1: two-leg. Block 2: banded. Block 3: single-leg."},
+      {icon:"🦸",name:"Supermans",detail:"15 reps",note:"Every round"},
+      {icon:"⏱️",name:"Plank",detail:"2:00 hold",note:""},
+    ],
+    notes:"Mirrors IFT event order: pull-ups first, then push-ups, sit-ups, run. 2 rounds only. Add 3rd when pull-ups reach 12+ per set.",
+    whyItWorks:"IFT event order teaches the specific fatigue sequence of test day."},
+  D:{duration:"~40 min",rounds:"4 rounds",rest:"90 sec between rounds",
+    exercises:[
+      {icon:"🌳",name:"Pull-ups",detail:"{pullups} reps (stop 1–2 short of failure)",note:"Don't go to failure — preserves quality across rounds"},
+      {icon:"💪",name:"Push-ups",detail:"{pushups} reps",note:""},
+      {icon:"🏃",name:"Run",detail:"200m recovery jog",note:"Stay moving — transition, not dead rest"},
+      {icon:"🧘",name:"Sit-ups",detail:"{situps} reps",note:"Military standard"},
+      {icon:"🦵",name:"Walking Lunges",detail:"Full field (~50 reps)",note:"Glute-dominant"},
+      {icon:"🔴",name:"Banded Good Mornings",detail:"15 reps",note:"Band behind neck, hinge at hip, drive hips forward"},
+      {icon:"🍑",name:"Glute Bridge",detail:"15 reps",note:"Block 1: two-leg. Block 2: banded. Block 3: single-leg."},
+      {icon:"🦸",name:"Supermans",detail:"15 reps",note:""},
+      {icon:"⏱️",name:"Plank",detail:"1:45 hold",note:""},
+    ],
+    notes:"Stopping 1–2 short of pull-up failure preserves quality across 4 rounds.",
+    whyItWorks:"Submaximal pull-up sets across 4 rounds build more total volume than grinding to failure."},
+  N:{duration:"~30 min",rounds:"Full sequence",rest:"5 min between events",
+    exercises:[
+      {icon:"🌳",name:"Pull-ups",detail:"Max reps — no time limit",note:"Full hang, chin over bar, full extension between reps"},
+      {icon:"⏸️",name:"Rest",detail:"5 min",note:""},
+      {icon:"💪",name:"Push-ups",detail:"2-minute max reps",note:"No sagging, full lockout"},
+      {icon:"⏸️",name:"Rest",detail:"5 min",note:""},
+      {icon:"🧘",name:"Sit-ups",detail:"2-minute max reps",note:"Feet flat, hands across chest, full crunch"},
+      {icon:"⏸️",name:"Rest",detail:"5 min",note:""},
+      {icon:"🏃",name:"1.5-mile run",detail:"Timed — full effort",note:"3.75 laps. Min: sub-10:20. Competitive: sub-9:00."},
+    ],
+    notes:"Diagnostic — record exact numbers every time. Results become the anchor for the next block's progression targets.",
+    whyItWorks:"The IFT is sequential — you enter the run carrying calisthenics fatigue. Simulation trains that exact sequence."},
+  P:{duration:"~55 min",rounds:"Up + down pyramid",rest:"15–20 sec max between sets",
+    exercises:[
+      {icon:"🏃",name:"Warmup",detail:"800m at ~8:00/mi",note:"Zone 2 — get blood moving, don't push"},
+      {icon:"🔺",name:"Pyramid — Pull-ups",detail:"Target total: {pullupTotal} reps",note:"Cluster pyramid: ascend to ceiling (~5), descend, repeat mini-pyramids. Example: 1,2,3,4,5,4,3,2,1..."},
+      {icon:"🔺",name:"Pyramid — Push-ups",detail:"Target total: {pushupTotal} reps",note:"Set N = N×2, mirrors pull-up set."},
+      {icon:"🦵",name:"Pyramid — Lunges",detail:"Target total: {lungeTotal} reps",note:"Set N = N×3. Long stride, heel drive."},
+      {icon:"⚡",name:"Finisher lap 1",detail:"400m fast",note:"Target: {lapPace1} · 90 sec rest"},
+      {icon:"🧘",name:"Sit-ups after lap 1",detail:"{finSitups1} reps",note:"Military standard. Then 1:00 plank."},
+      {icon:"⚡",name:"Finisher lap 2",detail:"400m fast",note:""},
+      {icon:"🧘",name:"Sit-ups after lap 2",detail:"{finSitups1} reps",note:"Then 1:00 plank."},
+    ],
+    notes:"Goal: 100 pull-ups / 200 push-ups / 300 lunges (full Smith pyramid). Once hit, consider weight vest.",
+    whyItWorks:"Cluster pyramids keep rep quality high. Lunge volume builds posterior chain base."},
+  R:{duration:"~55 min",rounds:"3 × 10-min EMOM blocks",rest:"2 min between blocks",
+    exercises:[
+      {icon:"🏃",name:"Warmup",detail:"800m at ~8:00/mi",note:"Zone 2 — conversational pace"},
+      {icon:"🌳",name:"Block 1 — Pull-ups (10 min)",detail:"Target total: {pullupTotal} reps",note:"4–5 reps every minute. Last 2–3 min should be a grind."},
+      {icon:"💪",name:"Block 2 — Push-ups (10 min)",detail:"Target total: {pushupTotal} reps",note:"12–15 reps every minute. Drop to knees to finish."},
+      {icon:"🦵",name:"Block 3 — Lower Body (10 min)",detail:"Target total: {lowerTotal} reps",note:"Week 1: walking lunges + glute bridges. Week 2: good mornings + lateral lunges. Week 3: reverse lunges + Supermans."},
+      {icon:"⚡",name:"Finisher",detail:"2 × 400m fast",note:"Target: {lapPace1} per lap. 90 sec rest between."},
+      {icon:"⏱️",name:"Plank circuit",detail:"1:30 hold after finisher",note:"Final hold"},
+    ],
+    notes:"Block 3 lower body rotates weekly. Hip flexors tight? Swap lunge minutes to good mornings.",
+    whyItWorks:"Isolated 10-min blocks build pattern-specific work capacity."},
+  S:{duration:"~65 min",rounds:"1 session",rest:"Continuous",
+    exercises:[
+      {icon:"🫀",name:"Zone 2 run",detail:"3 miles at 135–150 bpm",note:"Chase heart rate, not pace. ~9:00–9:30/mi. Nose breathing."},
+      {icon:"🦵",name:"Walking Lunges",detail:"Full field (~50 reps)",note:"Long stride, forward lean, heel drive — glute-dominant"},
+      {icon:"🔄",name:"Reverse Lunges",detail:"20 reps (10 each leg)",note:"Drive through front heel"},
+      {icon:"🔴",name:"Banded Good Mornings",detail:"3 × 15 reps",note:"Band behind neck, hinge, drive hips forward"},
+      {icon:"🍑",name:"Glute Bridge",detail:"3 × 15 reps",note:"Block 1: two-leg. Block 2: banded. Block 3: single-leg."},
+      {icon:"🦸",name:"Supermans",detail:"2 × 15 reps",note:"Mandatory counterbalance"},
+      {icon:"🌳",name:"Pull-ups — set 1",detail:"{pullups1} reps",note:"At the tree. Stop 1–2 short of failure."},
+      {icon:"🌳",name:"Pull-ups — set 2",detail:"{pullups1} reps",note:""},
+      {icon:"🌳",name:"Pull-ups — set 3",detail:"{pullups1} reps",note:""},
+      {icon:"💪",name:"Push-ups — set 1",detail:"{pushups1} reps",note:"Strict IFT form. 45 sec rest between sets."},
+      {icon:"💪",name:"Push-ups — set 2",detail:"{pushups1} reps",note:""},
+      {icon:"💪",name:"Push-ups — set 3",detail:"{pushups1} reps",note:""},
+      {icon:"🧘",name:"Sit-ups — set 1",detail:"{situps1} reps",note:"Military standard. 45 sec rest between sets."},
+      {icon:"🧘",name:"Sit-ups — set 2",detail:"{situps1} reps",note:""},
+      {icon:"🧘",name:"Sit-ups — set 3",detail:"{situps1} reps",note:""},
+      {icon:"⏱️",name:"Plank",detail:"1:00 hold",note:"Back-side balance"},
+      {icon:"🏃",name:"Cooldown jog",detail:"~1 mile easy (10:00–11:00/mi)",note:"Aerobic volume — mandatory."},
+    ],
+    notes:"Zone 2 run first. Posterior chain block while legs are warm. Cooldown mile is mandatory.",
+    whyItWorks:"Hamilton phasing: aerobic base first. Posterior chain between run and calisthenics."},
+};
+
+// Resolves {fieldKey} placeholders in exercise detail strings using current progression targets
+function resolveDetail(detailStr, wkId, getTargetFn) {
+  if(!detailStr || !detailStr.includes("{")) return detailStr;
+  return detailStr.replace(/\{(\w+)\}/g, (_, key) => {
+    const schema = getSchema(wkId);
+    const field = schema.find(f => f.key === key);
+    const val = getTargetFn(wkId, key);
+    if(val == null) return field?.prescribedTarget ?? "—";
+    if(field?.type === "time") return fmtTime(val);
+    return String(val);
+  });
+}
+
+// ── COMPONENTS ────────────────────────────────────────────────────────────────
+function Tag({label,color}){
+  return React.createElement("span",{style:{fontSize:10,fontWeight:700,letterSpacing:"0.08em",textTransform:"uppercase",color,background:color+"22",padding:"2px 7px",borderRadius:3,fontFamily:"ui-monospace,monospace"}},label);
+}
+
+function LogField({field,value,onChange,target}){
+  const base={width:"100%",background:C.card,border:`1px solid ${C.border2}`,borderRadius:6,color:C.text,padding:"9px 12px",outline:"none",boxSizing:"border-box",fontFamily:field.type==="num"||field.type==="time"?"ui-monospace,monospace":"system-ui,sans-serif",fontSize:field.type==="text"?13:16,fontWeight:field.type==="text"?400:600};
+  const isTime = field.type === "time";
+  const numVal = isTime ? parseTime(value) : parseFloat(value);
+  const hib = field.higherIsBetter !== false;
+  const beat = target != null && !isNaN(numVal) && numVal != null && (hib ? numVal >= target : numVal <= target);
+  const borderColor = beat ? C.green : (value ? C.blue : C.border2);
+  const displayTarget = target == null ? null : (isTime ? fmtTime(target) : target);
+  return(
+    React.createElement("div",{style:{marginBottom:16}},
+      React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:6}},
+        React.createElement("label",{style:{fontSize:12,fontWeight:600,color:C.text}},
+          field.label,
+          field.unit?React.createElement("span",{style:{color:C.muted,fontWeight:400}},` (${field.unit})`):"",
+        ),
+        target!=null&&React.createElement("span",{style:{fontSize:11,fontFamily:"ui-monospace,monospace",color:C.amber}},`target: ${displayTarget}${field.ceiling?` / ${field.ceiling} max`:""}`),
+      ),
+      field.type==="select"
+        ?React.createElement("select",{value:value??"",onChange:e=>onChange(e.target.value),style:{...base,fontSize:13,fontWeight:400}},
+            React.createElement("option",{value:""},"Select..."),
+            field.options.map(o=>React.createElement("option",{key:o,value:o},o)),
+          )
+        :field.type==="text"
+          ?React.createElement("textarea",{value:value??"",onChange:e=>onChange(e.target.value),rows:3,placeholder:field.placeholder??"",style:{...base,resize:"vertical",lineHeight:1.6}})
+          :React.createElement("input",{type:"text",inputMode:field.type==="num"?"decimal":"text",value:value??"",onChange:e=>onChange(e.target.value),placeholder:field.placeholder??"",style:{...base,border:`1px solid ${borderColor}`}}),
+    )
+  );
+}
+
+function StatBar({metric,best}){
+  const val=best??metric.baseline;
+  const p=pct(val,metric);
+  const atMin=metric.higherIsBetter?val>=metric.min:val<=metric.min;
+  const atComp=metric.higherIsBetter?val>=metric.comp:val<=metric.comp;
+  const barColor=atComp?C.green:atMin?C.amber:C.red;
+  const displayVal=metric.unit==="mm:ss"?fmtTime(val):val;
+  return(
+    React.createElement("div",{style:{marginBottom:18}},
+      React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:6}},
+        React.createElement("span",{style:{fontSize:13,fontWeight:600,color:C.text}},metric.label),
+        React.createElement("div",{style:{display:"flex",gap:8,alignItems:"baseline"}},
+          React.createElement("span",{style:{fontSize:22,fontWeight:800,color:barColor,fontFamily:"ui-monospace,monospace",lineHeight:1}},displayVal),
+          React.createElement("span",{style:{fontSize:10,color:C.muted}},metric.unit),
+        ),
+      ),
+      React.createElement("div",{style:{position:"relative",height:6,background:C.border,borderRadius:3,overflow:"hidden"}},
+        React.createElement("div",{style:{position:"absolute",left:0,top:0,height:"100%",width:`${p}%`,background:barColor,borderRadius:3,transition:"width 0.4s ease"}}),
+      ),
+      React.createElement("div",{style:{display:"flex",justifyContent:"space-between",marginTop:4}},
+        React.createElement("span",{style:{fontSize:10,color:C.dim}},`Baseline: ${metric.unit==="mm:ss"?fmtTime(metric.baseline):metric.baseline}`),
+        React.createElement("span",{style:{fontSize:10,color:C.muted}},`Min: `,React.createElement("span",{style:{color:C.amber}},metric.unit==="mm:ss"?fmtTime(metric.min):metric.min),` · Target: `,React.createElement("span",{style:{color:C.green}},metric.unit==="mm:ss"?fmtTime(metric.comp):metric.comp)),
+      ),
+    )
+  );
+}
+
+// ── MAIN APP ──────────────────────────────────────────────────────────────────
+function App(){
+  const[view,setView]=useState("schedule");
+  const[currentBlock,setCurrentBlock]=useState(0);
+  const[currentWeek,setCurrentWeek]=useState(0);
+  const[bests,setBests]=useState({});
+  const[logs,setLogs]=useState({});
+  const[progression,setProgression]=useState({});
+  const[pullPush,setPullPush]=useState(null);
+  const[logDay,setLogDay]=useState(null);
+  const[logValues,setLogValues]=useState({});
+  const[logIsFinisher,setLogIsFinisher]=useState(false);
+  const[detailId,setDetailId]=useState(null);
+  const[finisherDay,setFinisherDay]=useState(null);
+  const[saving,setSaving]=useState(false);
+  const[saved,setSaved]=useState(false);
+  const[saveError,setSaveError]=useState(false);
+  const[loaded,setLoaded]=useState(false);
+  const[serverOk,setServerOk]=useState(true);
+
+  // Full data state for saving
+  const dataRef=React.useRef({});
+
+  useEffect(()=>{
+    async function load(){
+      const data=await DB.load();
+      if(!data){
+        setServerOk(false);
+        setLoaded(true);
+        return;
+      }
+      const pos=data.program_position??{};
+      setCurrentBlock(pos.block??0);
+      setCurrentWeek(pos.week??0);
+      setBests(data.ift_bests??{});
+      setLogs(data.session_logs??{});
+      setProgression(data.progression??{});
+      setPullPush(data.pullpush_block??null);
+      dataRef.current=data;
+      setLoaded(true);
+    }
+    load();
+  },[]);
+
+  async function persist(updates){
+    const merged={...dataRef.current,...updates};
+    dataRef.current=merged;
+    const ok=await DB.save(merged);
+    return ok;
+  }
+
+  // Save position on navigation
+  useEffect(()=>{
+    if(!loaded)return;
+    persist({program_position:{block:currentBlock,week:currentWeek}});
+  },[currentBlock,currentWeek,loaded]);
+
+  const block=BLOCKS[currentBlock];
+  const week=block.weeks[currentWeek];
+  const isTestWeek=currentWeek===3;
+  const totalWeeks=BLOCKS.length*4;
+  const currentGlobalWeek=currentBlock*4+currentWeek+1;
+
+  function getPrescription(day){return week[day]??null;}
+  function getLog(day){return logs[`log_b${currentBlock+1}_w${currentWeek}_${day}`]??null;}
+  function getFinisherLog(day){return logs[`finlog_b${currentBlock+1}_w${currentWeek}_${day}`]??null;}
+  function getProgKey(wkId,fieldKey){return`${wkId}_${fieldKey}`;}
+  function getTarget(wkId,fieldKey){
+    const stored=progression[getProgKey(wkId,fieldKey)]?.target;
+    if(stored!=null)return stored;
+    const schema=getSchema(wkId);
+    const field=schema.find(f=>f.key===fieldKey);
+    return field?.prescribedTarget??null;
+  }
+
+  function openLog(day){
+    const ex=getLog(day);setLogValues(ex?.values??{});setLogIsFinisher(false);setLogDay(day);setView("log");
+  }
+  function openFinisherLog(day){
+    const ex=getFinisherLog(day);setLogValues(ex?.values??{});setLogIsFinisher(true);setLogDay(day);setView("log");
+  }
+
+  async function saveLog(){
+    setSaving(true);setSaveError(false);
+    const wkId=logIsFinisher?null:getPrescription(logDay);
+    const finSchemaKey=logDay==="tue"?"FIN_TUE":"FIN_THU";
+    const schema=logIsFinisher?LOG_SCHEMAS[finSchemaKey]:getSchema(wkId);
+    const progWkId=logIsFinisher?finSchemaKey:wkId;
+    const logKey=logIsFinisher
+      ?`finlog_b${currentBlock+1}_w${currentWeek}_${logDay}`
+      :`log_b${currentBlock+1}_w${currentWeek}_${logDay}`;
+    const entry={values:logValues,date:new Date().toLocaleDateString(),wkId:logIsFinisher?finSchemaKey:wkId};
+    const newLogs={...logs,[logKey]:entry};
+    setLogs(newLogs);
+
+    const newBests={...bests};
+    schema.filter(f=>f.iftKey).forEach(f=>{
+      const raw=logValues[f.key];if(!raw)return;
+      const val=f.type==="time"?parseTime(raw):Number(raw);
+      if(isNaN(val)||val<=0)return;
+      const iftMetric=IFT.find(m=>m.key===f.iftKey);if(!iftMetric)return;
+      const prev=newBests[f.iftKey];
+      const better=prev==null||(iftMetric.higherIsBetter?val>prev:val<prev);
+      if(better)newBests[f.iftKey]=val;
+    });
+    setBests(newBests);
+
+    const newProg={...progression};
+    schema.filter(f=>f.trackProgression).forEach(f=>{
+      const raw=logValues[f.key];if(!raw)return;
+      const actual=f.type==="time"?parseTime(raw):Number(raw);
+      if(isNaN(actual)||actual<=0)return;
+      const pk=getProgKey(progWkId,f.key);
+      const seed=f.prescribedTarget??actual;
+      const ex=newProg[pk]??{target:seed,lastActual:null,lastTarget:seed,history:[]};
+      const hib=f.higherIsBetter!==false;
+      const nextTarget=calcTarget(actual,ex.lastTarget??seed,seed,f.ceiling??null,hib);
+      newProg[pk]={target:nextTarget,lastActual:actual,lastTarget:ex.target,history:[...(ex.history??[]).slice(-11),{week:currentGlobalWeek,actual,target:ex.target}]};
+    });
+    setProgression(newProg);
+
+    const ok=await persist({session_logs:newLogs,ift_bests:newBests,progression:newProg});
+    setSaving(false);
+    if(ok){setSaved(true);setTimeout(()=>setSaved(false),2000);setView("schedule");}
+    else{setSaveError(true);}
+  }
+
+  function advanceWeek(){
+    if(currentWeek<3)setCurrentWeek(w=>w+1);
+    else if(currentBlock<BLOCKS.length-1){setCurrentBlock(b=>b+1);setCurrentWeek(0);}
+  }
+  function retreatWeek(){
+    if(currentWeek>0)setCurrentWeek(w=>w-1);
+    else if(currentBlock>0){setCurrentBlock(b=>b-1);setCurrentWeek(3);}
+  }
+
+  const DAYS=[
+    {key:"mon",label:"MON",type:"workout"},
+    {key:"tue",label:"TUE",type:"boxing"},
+    {key:"wed",label:"WED",type:"workout"},
+    {key:"thu",label:"THU",type:"boxing"},
+    {key:"fri",label:"FRI",type:"workout"},
+    {key:"sat",label:"SAT",type:"rest"},
+    {key:"sun",label:"SUN",type:"rest"},
+  ];
+  const todayKey=(()=>{const days=["sun","mon","tue","wed","thu","fri","sat"];return days[new Date().getDay()];})();
+
+  const S=(style)=>style; // style passthrough for clarity
+
+  if(!loaded){
+    return React.createElement("div",{style:{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column",gap:12}},
+      React.createElement("div",{style:{color:C.muted,fontFamily:"ui-monospace,monospace",fontSize:13}},"Loading..."),
+    );
+  }
+
+  if(!serverOk){
+    return React.createElement("div",{style:{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",padding:24}},
+      React.createElement("div",{style:{background:C.card,border:`1px solid ${C.red}40`,borderRadius:10,padding:24,maxWidth:440,textAlign:"center"}},
+        React.createElement("div",{style:{fontSize:24,marginBottom:12}},"⚠️"),
+        React.createElement("h2",{style:{color:C.text,fontSize:16,fontWeight:700,marginBottom:12}},"Server not running"),
+        React.createElement("p",{style:{color:C.muted,fontSize:13,lineHeight:1.7,marginBottom:16}},"Open a terminal, navigate to the folder containing these files, and run:"),
+        React.createElement("code",{style:{display:"block",background:C.bg,padding:"10px 14px",borderRadius:6,color:C.green,fontFamily:"ui-monospace,monospace",fontSize:13,marginBottom:16}},"python3 server.py"),
+        React.createElement("p",{style:{color:C.muted,fontSize:12}},"Then refresh this page."),
+      ),
+    );
+  }
+
+  // ── LOG VIEW ────────────────────────────────────────────────────────────────
+  if(view==="log"){
+    const wkId=logIsFinisher?null:getPrescription(logDay);
+    const wk=wkId?WORKOUTS[wkId]:null;
+    const finSchemaKey=logDay==="tue"?"FIN_TUE":"FIN_THU";
+    const schema=logIsFinisher?LOG_SCHEMAS[finSchemaKey]:getSchema(wkId);
+    const fin=logIsFinisher?BOXING_FINISHERS[logDay]:null;
+    const color=logIsFinisher?(fin?.color??C.muted):(wk?FORMAT_COLOR[wk.format]:C.muted);
+    const progWkId=logIsFinisher?finSchemaKey:wkId;
+    return React.createElement("div",{style:{padding:"24px 16px",maxWidth:680,margin:"0 auto"}},
+      React.createElement("button",{onClick:()=>setView("schedule"),style:{background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:12,marginBottom:20,padding:0}},"\u2190 Back"),
+      React.createElement("div",{style:{marginBottom:24}},
+        React.createElement("div",{style:{fontSize:10,color:C.muted,textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:6,fontFamily:"ui-monospace,monospace"}},`${block.name} · ${week.label} · ${logDay?.toUpperCase()}`),
+        React.createElement("div",{style:{display:"flex",alignItems:"center",gap:10,marginBottom:8}},
+          React.createElement("span",{style:{fontSize:20}},logIsFinisher?(fin?.emoji??"🥊"):(wk?.emoji??"")),
+          React.createElement("h2",{style:{margin:0,fontSize:20,fontWeight:700,color:C.text}},logIsFinisher?`Boxing Finisher — ${fin?.label??""}`:(`${wkId}. ${wk?.name??""}`)),
+        ),
+        React.createElement(Tag,{label:logIsFinisher?"Boxing Finisher":(wk?.format??""),color}),
+      ),
+      React.createElement("div",{style:{background:C.card,border:`1px solid ${color}30`,borderRadius:10,padding:16,marginBottom:20}},
+        React.createElement("div",{style:{fontSize:10,color,textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:16,fontFamily:"ui-monospace,monospace"}},"Session Log"),
+        schema.map(field=>React.createElement(LogField,{key:field.key,field,value:logValues[field.key]??"",onChange:v=>setLogValues(p=>({...p,[field.key]:v})),target:field.trackProgression?getTarget(progWkId,field.key):null})),
+      ),
+      React.createElement("button",{onClick:saveLog,disabled:saving,style:{width:"100%",padding:14,borderRadius:8,border:"none",background:saved?C.green:C.amber,color:"#000",fontSize:14,fontWeight:700,cursor:saving?"not-allowed":"pointer"}},
+        saving?"Saving...":saved?"Saved ✓":"Save Session",
+      ),
+      saveError&&React.createElement("p",{style:{fontSize:12,color:C.red,marginTop:12,textAlign:"center"}},"Save failed — is server.py still running?"),
+    );
+  }
+
+  // ── DETAIL VIEW ─────────────────────────────────────────────────────────────
+  if(view==="detail"&&detailId){
+    const wk=WORKOUTS[detailId];
+    const detail=WORKOUT_DETAIL[detailId];
+    const color=FORMAT_COLOR[wk.format];
+    return React.createElement("div",{style:{padding:"24px 16px",maxWidth:680,margin:"0 auto"}},
+      React.createElement("button",{onClick:()=>setView("schedule"),style:{background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:12,marginBottom:20,padding:0}},"\u2190 Back"),
+      React.createElement("div",{style:{display:"flex",gap:6,marginBottom:10}},React.createElement(Tag,{label:wk.format,color}),React.createElement(Tag,{label:wk.tag,color:C.muted})),
+      React.createElement("div",{style:{display:"flex",alignItems:"center",gap:10,marginBottom:6}},React.createElement("span",{style:{fontSize:26}},wk.emoji),React.createElement("h2",{style:{margin:0,fontSize:22,fontWeight:800,color:C.text}},`${detailId}. ${wk.name}`)),
+      detail&&React.createElement("div",null,
+        React.createElement("div",{style:{display:"flex",gap:16,fontSize:12,color:C.muted,flexWrap:"wrap",marginBottom:20}},
+          React.createElement("span",null,`⏱ ${detail.duration}`),React.createElement("span",null,`🔁 ${detail.rounds}`),React.createElement("span",null,`💤 ${detail.rest}`),
+        ),
+        React.createElement("div",{style:{background:C.card,borderRadius:10,border:`1px solid ${color}40`,overflow:"hidden",marginBottom:16}},
+          React.createElement("div",{style:{padding:"10px 16px",borderBottom:`1px solid ${C.border}`,background:color+"0c"}},
+            React.createElement("span",{style:{fontSize:10,color,textTransform:"uppercase",letterSpacing:"0.1em",fontWeight:700,fontFamily:"ui-monospace,monospace"}},"Circuit"),
+          ),
+          detail.exercises.map((ex,i)=>
+            React.createElement("div",{key:i,style:{display:"flex",alignItems:"flex-start",gap:12,padding:"12px 16px",borderBottom:i<detail.exercises.length-1?`1px solid ${C.border}`:"none"}},
+              React.createElement("div",{style:{width:36,height:36,borderRadius:8,background:C.bg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0}},ex.icon),
+              React.createElement("div",{style:{flex:1}},
+                React.createElement("div",{style:{display:"flex",alignItems:"baseline",gap:8,flexWrap:"wrap"}},
+                  React.createElement("span",{style:{fontSize:14,fontWeight:600,color:C.text}},ex.name),
+                  ex.detail&&React.createElement("span",{style:{fontSize:13,color,fontWeight:500,fontFamily:"ui-monospace,monospace"}},resolveDetail(ex.detail,detailId,getTarget)),
+                ),
+                ex.note&&React.createElement("div",{style:{fontSize:11,color:C.dim,marginTop:3}},`↳ ${resolveDetail(ex.note,detailId,getTarget)}`),
+              ),
+            )
+          ),
+        ),
+        React.createElement("div",{style:{background:C.card,borderRadius:10,border:`1px solid ${C.border}`,padding:"14px 16px",marginBottom:12}},
+          React.createElement("div",{style:{fontSize:10,color:C.muted,textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:8,fontFamily:"ui-monospace,monospace"}},"Why it works"),
+          React.createElement("p",{style:{margin:0,fontSize:13,color:C.muted,lineHeight:1.65}},detail.whyItWorks),
+        ),
+        React.createElement("div",{style:{background:C.card,borderRadius:10,border:`1px solid ${C.border}`,padding:"14px 16px",marginBottom:24}},
+          React.createElement("div",{style:{fontSize:10,color:C.muted,textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:8,fontFamily:"ui-monospace,monospace"}},"Programming note"),
+          React.createElement("p",{style:{margin:0,fontSize:13,color:C.muted,lineHeight:1.65}},detail.notes),
+        ),
+      ),
+    );
+  }
+
+  // ── FINISHER VIEW ───────────────────────────────────────────────────────────
+  if(view==="finisher"&&finisherDay){
+    const f=BOXING_FINISHERS[finisherDay];
+    return React.createElement("div",{style:{padding:"24px 16px",maxWidth:680,margin:"0 auto"}},
+      React.createElement("button",{onClick:()=>setView("schedule"),style:{background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:12,marginBottom:20,padding:0}},"\u2190 Back"),
+      React.createElement(Tag,{label:"Boxing Finisher",color:f.color}),
+      React.createElement("h2",{style:{margin:"10px 0 4px",fontSize:22,fontWeight:800,color:C.text}},`${finisherDay==="tue"?"Tuesday":"Thursday"} — ${f.label}`),
+      React.createElement("div",{style:{fontSize:12,color:C.muted,marginBottom:20}},`⏱ ${f.duration} · After boxing · Bodyweight only`),
+      React.createElement("div",{style:{background:C.card,borderRadius:10,border:`1px solid ${f.color}40`,overflow:"hidden",marginBottom:16}},
+        f.exercises.map((ex,i)=>
+          React.createElement("div",{key:i,style:{display:"flex",alignItems:"flex-start",gap:12,padding:"12px 16px",borderBottom:i<f.exercises.length-1?`1px solid ${C.border}`:"none"}},
+            React.createElement("div",{style:{width:36,height:36,borderRadius:8,background:C.bg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0}},ex.icon),
+            React.createElement("div",{style:{flex:1}},
+              React.createElement("div",{style:{display:"flex",alignItems:"baseline",gap:8}},
+                React.createElement("span",{style:{fontSize:14,fontWeight:600,color:C.text}},ex.name),
+                React.createElement("span",{style:{fontSize:13,color:f.color,fontWeight:500,fontFamily:"ui-monospace,monospace"}},ex.detail),
+              ),
+              ex.note&&React.createElement("div",{style:{fontSize:11,color:C.dim,marginTop:3}},`↳ ${ex.note}`),
+            ),
+          )
+        ),
+      ),
+      React.createElement("div",{style:{background:C.card,borderRadius:10,border:`1px solid ${C.border}`,padding:"14px 16px"}},
+        React.createElement("div",{style:{fontSize:10,color:C.muted,textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:8,fontFamily:"ui-monospace,monospace"}},"Programming note"),
+        React.createElement("p",{style:{margin:0,fontSize:13,color:C.muted,lineHeight:1.65}},f.notes),
+      ),
+    );
+  }
+
+  // ── PROGRESS VIEW ───────────────────────────────────────────────────────────
+  if(view==="progress"){
+    return React.createElement("div",{style:{padding:"24px 16px",maxWidth:680,margin:"0 auto"}},
+      React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:24}},
+        React.createElement("h2",{style:{margin:0,fontSize:18,fontWeight:700,color:C.text}},"Progress"),
+        React.createElement("button",{onClick:()=>setView("schedule"),style:{background:"none",border:`1px solid ${C.border2}`,color:C.muted,cursor:"pointer",fontSize:12,padding:"6px 12px",borderRadius:6}},"Schedule"),
+      ),
+      // IFT bars
+      React.createElement("div",{style:{background:C.card,borderRadius:10,border:`1px solid ${C.border}`,padding:16,marginBottom:16}},
+        React.createElement("div",{style:{fontSize:10,color:C.muted,textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:16,fontFamily:"ui-monospace,monospace"}},"IFT Competitive Targets"),
+        IFT.map(m=>React.createElement(StatBar,{key:m.key,metric:m,best:bests[m.key]??null})),
+      ),
+      // Program position
+      React.createElement("div",{style:{background:C.card,borderRadius:10,border:`1px solid ${C.border}`,padding:16,marginBottom:16}},
+        React.createElement("div",{style:{fontSize:10,color:C.muted,textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:12,fontFamily:"ui-monospace,monospace"}},"Program Position"),
+        React.createElement("div",{style:{display:"flex",gap:0,marginBottom:8}},
+          Array.from({length:totalWeeks}).map((_,i)=>{
+            const isCur=i===currentGlobalWeek-1,isTest=(i+1)%4===0,isPast=i<currentGlobalWeek-1;
+            return React.createElement("div",{key:i,style:{flex:1,height:8,borderRadius:2,margin:"0 1px",background:isCur?C.amber:isPast?C.green+"80":isTest?C.border2:C.border}});
+          }),
+        ),
+        React.createElement("div",{style:{display:"flex",justifyContent:"space-between",fontSize:11,marginBottom:10}},
+          React.createElement("span",{style:{color:C.muted}},`Week ${currentGlobalWeek}/${totalWeeks}`),
+          React.createElement("span",{style:{color:C.amber,fontFamily:"ui-monospace,monospace"}},block.name),
+        ),
+        React.createElement("div",{style:{fontSize:12,color:C.muted}},
+          React.createElement("span",{style:{color:C.text,fontWeight:600}},"Phase: "),block.phase,React.createElement("br",null),
+          React.createElement("span",{style:{color:C.text,fontWeight:600}},"Goal: "),block.goal,
+        ),
+      ),
+      // Progression targets
+      Object.keys(progression).length>0&&React.createElement("div",{style:{background:C.card,borderRadius:10,border:`1px solid ${C.border}`,padding:16,marginBottom:16}},
+        React.createElement("div",{style:{fontSize:10,color:C.muted,textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:12,fontFamily:"ui-monospace,monospace"}},"Workout Progression Targets"),
+        Object.entries(progression).map(([pk,data])=>{
+          const[wkId,fieldKey]=pk.split("_");
+          const schema=getSchema(wkId);
+          const field=schema.find(f=>f.key===fieldKey);if(!field)return null;
+          const wk=WORKOUTS[wkId];
+          const color=wk?FORMAT_COLOR[wk.format]:C.muted;
+          const history=data.history??[];
+          return React.createElement("div",{key:pk,style:{marginBottom:16,paddingBottom:16,borderBottom:`1px solid ${C.border}`}},
+            React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}},
+              React.createElement("div",null,
+                React.createElement("span",{style:{fontSize:11,fontWeight:700,color,fontFamily:"ui-monospace,monospace"}},wkId),
+                React.createElement("span",{style:{fontSize:11,color:C.muted}},` · ${field.label}`),
+              ),
+              React.createElement("div",{style:{textAlign:"right"}},
+                React.createElement("div",{style:{fontSize:18,fontWeight:800,color:C.amber,fontFamily:"ui-monospace,monospace"}},`${data.target}${field.unit?` ${field.unit}`:""}`),
+                React.createElement("div",{style:{fontSize:9,color:C.dim}},"next target"),
+              ),
+            ),
+            history.length>1&&React.createElement("div",{style:{display:"flex",alignItems:"flex-end",gap:3,height:40}},
+              history.slice(-8).map((h,i)=>{
+                const maxV=Math.max(...history.slice(-8).map(x=>x.actual));
+                const barH=maxV>0?Math.round((h.actual/maxV)*100):20;
+                const beat=h.actual>=(h.target??0);
+                return React.createElement("div",{key:i,style:{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:2}},
+                  React.createElement("div",{style:{width:"100%",background:beat?C.green:C.orange,borderRadius:"2px 2px 0 0",height:`${barH}%`,minHeight:4}}),
+                  React.createElement("div",{style:{fontSize:8,color:C.dim,fontFamily:"ui-monospace,monospace"}},`W${h.week}`),
+                );
+              }),
+            ),
+            data.lastActual!=null&&React.createElement("div",{style:{fontSize:11,color:C.muted,marginTop:6}},"Last: ",React.createElement("span",{style:{color:C.text,fontFamily:"ui-monospace,monospace",fontWeight:600}},`${data.lastActual}${field.unit?` ${field.unit}`:""}`)),
+          );
+        }),
+      ),
+      // Session history
+      React.createElement("div",{style:{marginBottom:24}},
+        React.createElement("div",{style:{fontSize:10,color:C.muted,textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:12,fontFamily:"ui-monospace,monospace"}},"Session History"),
+        Object.keys(logs).length===0
+          ?React.createElement("p",{style:{fontSize:12,color:C.dim}},"No sessions logged yet.")
+          :Object.entries(logs).sort((a,b)=>b[0].localeCompare(a[0])).map(([key,entry])=>{
+              const wk=entry.wkId?WORKOUTS[entry.wkId]:null;
+              const color=wk?FORMAT_COLOR[wk.format]:C.muted;
+              return React.createElement("div",{key,style:{padding:"12px 14px",background:C.card,border:`1px solid ${C.border}`,borderRadius:6,marginBottom:8}},
+                React.createElement("div",{style:{display:"flex",justifyContent:"space-between",marginBottom:6}},
+                  React.createElement("div",{style:{display:"flex",gap:8,alignItems:"center"}},
+                    wk&&React.createElement("span",{style:{fontSize:13}},wk.emoji),
+                    React.createElement("span",{style:{fontSize:12,fontWeight:700,color}},`${entry.wkId??""} ${wk?.name??""}`),
+                  ),
+                  React.createElement("span",{style:{fontSize:11,color:C.dim}},entry.date),
+                ),
+                React.createElement("div",{style:{display:"flex",flexWrap:"wrap",gap:"4px 16px"}},
+                  Object.entries(entry.values??{}).filter(([k])=>k!=="notes").map(([k,v])=>{
+                    const schema=getSchema(entry.wkId);
+                    const field=schema.find(f=>f.key===k);
+                    return React.createElement("span",{key:k,style:{fontSize:11,color:C.muted}},
+                      `${field?.label??k}: `,React.createElement("span",{style:{color:C.text,fontFamily:"ui-monospace,monospace",fontWeight:600}},v),
+                    );
+                  }),
+                ),
+                entry.values?.notes&&React.createElement("div",{style:{fontSize:11,color:C.muted,marginTop:6,fontStyle:"italic"}},entry.values.notes),
+              );
+            }),
+      ),
+    );
+  }
+
+  // ── SCHEDULE VIEW ───────────────────────────────────────────────────────────
+  return React.createElement("div",{style:{minHeight:"100vh"}},
+    // Header
+    React.createElement("div",{style:{padding:"24px 20px 16px",borderBottom:`1px solid ${C.border}`}},
+      React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}},
+        React.createElement("div",null,
+          React.createElement("div",{style:{fontSize:10,color:C.muted,textTransform:"uppercase",letterSpacing:"0.12em",marginBottom:4,fontFamily:"ui-monospace,monospace"}},"AF SpecWar IFT Prep"),
+          React.createElement("h1",{style:{margin:0,fontSize:22,fontWeight:800,color:C.text,letterSpacing:"-0.02em"}},block.name),
+          React.createElement("div",{style:{marginTop:4,fontSize:12,color:C.muted}},week.label,isTestWeek?React.createElement("span",{style:{color:C.amber}}," — Test Week"):React.createElement("span",null,` — ${block.goal}`)),
+          React.createElement("div",{style:{marginTop:6,fontSize:11,color:C.cyan}},`🫀 ${block.runFocus}`),
+        ),
+        React.createElement("div",{style:{display:"flex",flexDirection:"column",gap:6,alignItems:"flex-end"}},
+          React.createElement("button",{onClick:()=>setView("progress"),style:{background:C.amberLo,border:`1px solid ${C.amber}40`,color:C.amber,cursor:"pointer",fontSize:11,fontWeight:700,padding:"7px 12px",borderRadius:6,fontFamily:"ui-monospace,monospace",textTransform:"uppercase"}},"Progress"),
+        ),
+      ),
+      // Week bar
+      React.createElement("div",{style:{marginTop:16}},
+        React.createElement("div",{style:{display:"flex",gap:0}},
+          Array.from({length:totalWeeks}).map((_,i)=>{
+            const isCur=i===currentGlobalWeek-1,isTest=(i+1)%4===0,isPast=i<currentGlobalWeek-1;
+            return React.createElement("div",{key:i,style:{flex:1,height:4,borderRadius:2,margin:"0 1px",background:isCur?C.amber:isPast?C.green+"90":isTest?C.border2:C.border}});
+          }),
+        ),
+        React.createElement("div",{style:{display:"flex",justifyContent:"space-between",marginTop:6}},
+          React.createElement("span",{style:{fontSize:10,color:C.dim,fontFamily:"ui-monospace,monospace"}},`WK ${currentGlobalWeek}/${totalWeeks}`),
+          React.createElement("div",{style:{display:"flex",gap:10}},
+            React.createElement("button",{onClick:retreatWeek,disabled:currentBlock===0&&currentWeek===0,style:{background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:16,padding:0}},"‹"),
+            React.createElement("button",{onClick:advanceWeek,disabled:currentBlock===BLOCKS.length-1&&currentWeek===3,style:{background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:16,padding:0}},"›"),
+          ),
+        ),
+      ),
+    ),
+    // Day cards
+    React.createElement("div",{style:{padding:"16px 20px"}},
+      DAYS.map(({key,label,type})=>{
+        const isToday=key===todayKey;
+        const actualWkId=type==="workout"?getPrescription(key):null;
+        const wk=actualWkId?WORKOUTS[actualWkId]:null;
+        const logged=type==="workout"?getLog(key):null;
+        const fmtColor=wk?FORMAT_COLOR[wk.format]:null;
+        const fin=type==="boxing"?BOXING_FINISHERS[key]:null;
+        const finLogged=type==="boxing"?getFinisherLog(key):null;
+        return React.createElement("div",{key,style:{marginBottom:10,borderRadius:8,border:`1px solid ${isToday?C.amber+"60":C.border}`,background:isToday?C.amberLo:C.card,overflow:"hidden"}},
+          React.createElement("div",{style:{display:"flex",alignItems:"center"}},
+            React.createElement("div",{style:{width:52,padding:"14px 0",textAlign:"center",flexShrink:0,borderRight:`1px solid ${C.border}`}},
+              React.createElement("div",{style:{fontSize:10,fontWeight:800,color:isToday?C.amber:C.muted,letterSpacing:"0.1em",fontFamily:"ui-monospace,monospace"}},label),
+              isToday&&React.createElement("div",{style:{fontSize:8,color:C.amber,marginTop:3,fontFamily:"ui-monospace,monospace"}},"TODAY"),
+            ),
+            React.createElement("div",{style:{flex:1,padding:"12px 14px"}},
+              type==="rest"&&React.createElement("span",{style:{fontSize:13,color:C.dim}},"Rest"),
+              type==="boxing"&&React.createElement("div",null,
+                React.createElement("div",{style:{display:"flex",alignItems:"center",gap:8,marginBottom:fin?5:0}},
+                  React.createElement("span",{style:{fontSize:16}},"🥊"),React.createElement("span",{style:{fontSize:13,fontWeight:600,color:C.muted}},"Boxing"),
+                ),
+                fin&&React.createElement("div",{style:{display:"flex",alignItems:"center",gap:6}},
+                  React.createElement("span",{style:{fontSize:12}},fin.emoji),
+                  React.createElement("span",{style:{fontSize:11,color:fin.color,fontWeight:600}},fin.label),
+                  React.createElement("span",{style:{fontSize:10,color:C.dim}},`· ${fin.duration}`),
+                  finLogged&&React.createElement("span",{style:{fontSize:11,color:C.green,marginLeft:4}},"✓"),
+                ),
+              ),
+              type==="workout"&&wk&&React.createElement("div",null,
+                React.createElement("div",{style:{display:"flex",alignItems:"center",gap:8,marginBottom:4}},
+                  React.createElement("span",{style:{fontSize:15}},wk.emoji),
+                  React.createElement("span",{style:{fontSize:13,fontWeight:700,color:C.text}},`${actualWkId}. ${wk.name}`),
+                  logged&&React.createElement("span",{style:{fontSize:11,color:C.green}},"✓"),
+                ),
+                React.createElement("div",{style:{display:"flex",gap:6,flexWrap:"wrap"}},
+                  React.createElement(Tag,{label:wk.format,color:fmtColor}),
+                  React.createElement(Tag,{label:wk.tag,color:C.muted}),
+                ),
+              ),
+            ),
+            type==="boxing"&&fin&&React.createElement("div",{style:{display:"flex",flexDirection:"column",gap:5,margin:"0 12px",flexShrink:0}},
+              React.createElement("button",{onClick:()=>{setFinisherDay(key);setView("finisher");},style:{background:"none",border:`1px solid ${C.border2}`,color:C.muted,cursor:"pointer",fontSize:10,fontWeight:700,padding:"5px 10px",borderRadius:5,fontFamily:"ui-monospace,monospace",textTransform:"uppercase"}},"View"),
+              React.createElement("button",{onClick:()=>openFinisherLog(key),style:{background:finLogged?C.greenLo:C.blueLo,border:`1px solid ${finLogged?C.green+"40":C.blue+"40"}`,color:finLogged?C.green:C.blue,cursor:"pointer",fontSize:10,fontWeight:700,padding:"5px 10px",borderRadius:5,fontFamily:"ui-monospace,monospace",textTransform:"uppercase"}},finLogged?"Edit":"Log"),
+            ),
+            type==="workout"&&wk&&React.createElement("div",{style:{display:"flex",flexDirection:"column",gap:5,margin:"0 12px",flexShrink:0}},
+              React.createElement("button",{onClick:()=>{setDetailId(actualWkId);setView("detail");},style:{background:"none",border:`1px solid ${C.border2}`,color:C.muted,cursor:"pointer",fontSize:10,fontWeight:700,padding:"5px 10px",borderRadius:5,fontFamily:"ui-monospace,monospace",textTransform:"uppercase"}},"View"),
+              React.createElement("button",{onClick:()=>openLog(key),style:{background:logged?C.greenLo:C.blueLo,border:`1px solid ${logged?C.green+"40":C.blue+"40"}`,color:logged?C.green:C.blue,cursor:"pointer",fontSize:10,fontWeight:700,padding:"5px 10px",borderRadius:5,fontFamily:"ui-monospace,monospace",textTransform:"uppercase"}},logged?"Edit":"Log"),
+            ),
+          ),
+        );
+      }),
+    ),
+    // Mini IFT snapshot
+    React.createElement("div",{style:{margin:"0 20px 16px",padding:"14px 16px",background:C.card,border:`1px solid ${C.border}`,borderRadius:8}},
+      React.createElement("div",{style:{fontSize:10,color:C.muted,textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:12,fontFamily:"ui-monospace,monospace"}},"IFT Bests vs Targets"),
+      React.createElement("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px 20px"}},
+        IFT.map(m=>{
+          const val=bests[m.key]??m.baseline;
+          const atMin=m.higherIsBetter?val>=m.min:val<=m.min;
+          const atComp=m.higherIsBetter?val>=m.comp:val<=m.comp;
+          const color=atComp?C.green:atMin?C.amber:C.red;
+          const display=m.unit==="mm:ss"?(bests[m.key]?fmtTime(bests[m.key]):"—"):(bests[m.key]??"—");
+          return React.createElement("div",{key:m.key},
+            React.createElement("div",{style:{fontSize:10,color:C.dim,marginBottom:3}},m.label),
+            React.createElement("div",{style:{display:"flex",alignItems:"baseline",gap:6}},
+              React.createElement("span",{style:{fontSize:18,fontWeight:800,color,fontFamily:"ui-monospace,monospace"}},display),
+              React.createElement("span",{style:{fontSize:10,color:C.dim}},`→ ${m.unit==="mm:ss"?fmtTime(m.comp):m.comp}`),
+            ),
+          );
+        }),
+      ),
+      React.createElement("button",{onClick:()=>setView("progress"),style:{marginTop:14,width:"100%",padding:8,background:"none",border:`1px solid ${C.border2}`,borderRadius:5,color:C.muted,cursor:"pointer",fontSize:11,fontFamily:"ui-monospace,monospace",textTransform:"uppercase"}},"Full Progress →"),
+    ),
+    isTestWeek&&React.createElement("div",{style:{margin:"0 20px 20px",padding:"14px 16px",background:C.card,border:`1px solid ${C.amber}40`,borderRadius:8}},
+      React.createElement("div",{style:{fontSize:10,color:C.amber,textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:8,fontFamily:"ui-monospace,monospace"}},currentBlock===3&&currentWeek===3?"Taper Week":"Test Week"),
+      React.createElement("p",{style:{margin:0,fontSize:13,color:C.muted,lineHeight:1.6}},
+        currentBlock===3&&currentWeek===3
+          ?"Final week before IFT. Volume drops 40%, intensity maintained. Sleep, hydrate, no new stimulus."
+          :"Run IFT land simulation (N) on Mon and Fri. Wednesday is active recovery (A). Record all four events.",
+      ),
+    ),
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
+</script>
+</body>
+</html>
