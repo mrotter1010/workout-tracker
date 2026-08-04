@@ -13,7 +13,7 @@ import os
 import sys
 from pathlib import Path
 
-PORT = 7731
+PORT = int(os.environ.get("PORT", 8080))
 DATA_FILE = Path(__file__).parent / "workout-data.json"
 
 class Handler(http.server.BaseHTTPRequestHandler):
